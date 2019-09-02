@@ -215,13 +215,14 @@ defmodule Mint.HTTP1 do
           method :: String.t(),
           path :: String.t(),
           Types.headers(),
-          body :: iodata() | nil | :stream
+          body :: iodata() | nil | :stream,
+          keyword()
         ) ::
           {:ok, t(), Types.request_ref()}
           | {:error, t(), Types.error()}
-  def request(conn, method, path, headers, body)
+  def request(conn, method, path, headers, body, options \\ [])
 
-  def request(%__MODULE__{state: :closed} = conn, _method, _path, _headers, _body) do
+  def request(%__MODULE__{state: :closed} = conn, _method, _path, _headers, _body, _options) do
     {:error, conn, wrap_error(:closed)}
   end
 
@@ -230,12 +231,13 @@ defmodule Mint.HTTP1 do
         _method,
         _path,
         _headers,
-        _body
+        _body,
+        _options
       ) do
     {:error, conn, wrap_error(:request_body_is_streaming)}
   end
 
-  def request(%__MODULE__{} = conn, method, path, headers, body) do
+  def request(%__MODULE__{} = conn, method, path, headers, body, _options) do
     %__MODULE__{transport: transport, socket: socket} = conn
 
     headers =

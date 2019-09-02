@@ -437,6 +437,13 @@ defmodule Mint.HTTP2 do
   the maximum number of concurrent streams supported by the server through
   `get_server_setting/2` (passing in the `:max_concurrent_streams` setting name).
 
+  ## Options
+
+  The following options are supported for HTTP/2 connections:
+
+    * `:priority` - sets the priority of the current request. See the "Request
+      priority" section in the module documentation.
+
   ## Header list size
 
   In HTTP/2, the server can optionally specify a maximum header list size that
@@ -452,13 +459,14 @@ defmodule Mint.HTTP2 do
           method :: String.t(),
           path :: String.t(),
           Types.headers(),
-          body :: iodata() | nil | :stream
+          body :: iodata() | nil | :stream,
+          keyword()
         ) ::
           {:ok, t(), Types.request_ref()}
           | {:error, t(), Types.error()}
-  def request(conn, method, path, headers, body)
+  def request(conn, method, path, headers, body, options \\ [])
 
-  def request(%Mint.HTTP2{state: :closed} = conn, _method, _path, _headers, _body) do
+  def request(%Mint.HTTP2{state: :closed} = conn, _method, _path, _headers, _body, _options) do
     {:error, conn, wrap_error(:closed)}
   end
 
@@ -467,13 +475,14 @@ defmodule Mint.HTTP2 do
         _method,
         _path,
         _headers,
-        _body
+        _body,
+        _options
       ) do
     {:error, conn, wrap_error(:closed_for_writing)}
   end
 
-  def request(%Mint.HTTP2{} = conn, method, path, headers, body)
-      when is_binary(method) and is_binary(path) and is_list(headers) do
+  def request(%Mint.HTTP2{} = conn, method, path, headers, body, options)
+      when is_binary(method) and is_binary(path) and is_list(headers) and is_list(options) do
     headers =
       headers
       |> downcase_header_names()
@@ -487,28 +496,43 @@ defmodule Mint.HTTP2 do
       | headers
     ]
 
+    priority = validate_priority!(options[:priority])
+
     {conn, stream_id, ref} = open_stream(conn)
 
-    conn =
+    {conn, payload} =
       case body do
         :stream ->
-          {conn, payload} = encode_headers(conn, stream_id, headers, [:end_headers])
-          send!(conn, payload)
+          encode_headers(conn, stream_id, headers, [:end_headers], priority)
 
         nil ->
-          {conn, payload} = encode_headers(conn, stream_id, headers, [:end_stream, :end_headers])
-          send!(conn, payload)
+          encode_headers(conn, stream_id, headers, [:end_stream, :end_headers], priority)
 
         _iodata ->
-          {conn, headers_payload} = encode_headers(conn, stream_id, headers, [:end_headers])
+          {conn, headers_payload} =
+            encode_headers(conn, stream_id, headers, [:end_headers], priority)
+
           {conn, data_payload} = encode_data(conn, stream_id, body, [:end_stream])
-          conn = send!(conn, [headers_payload, data_payload])
-          conn
+          {conn, [headers_payload, data_payload]}
       end
 
+    send!(conn, payload)
     {:ok, conn, ref}
   catch
     :throw, {:mint, conn, reason} -> {:error, conn, reason}
+  end
+
+  defp validate_priority!(nil), do: nil
+
+  defp validate_priority!({exclusive?, stream_dependency, weight} = priority)
+       when is_boolean(exclusive?) and
+              (is_reference(stream_dependency) or stream_dependency == nil) and weight in 1..256,
+       do: priority
+
+  defp validate_priority!(other) do
+    raise ArgumentError,
+          "the :priority option should be {exclusive?, request_dependency, weight} with " <>
+            "a boolean, a reference, and an integer in 1..255, got: #{inspect(other)}"
   end
 
   @doc """
@@ -552,7 +576,7 @@ defmodule Mint.HTTP2 do
                 throw({:mint, conn, error})
               end
 
-              encode_headers(conn, stream_id, trailing_headers, [:end_headers, :end_stream])
+              encode_headers(conn, stream_id, trailing_headers, [:end_headers, :end_stream], nil)
 
             iodata ->
               encode_data(conn, stream_id, iodata, [])
@@ -1109,13 +1133,13 @@ defmodule Mint.HTTP2 do
     {conn, stream.id, stream.ref}
   end
 
-  defp encode_headers(conn, stream_id, headers, enabled_flags) do
+  defp encode_headers(conn, stream_id, headers, enabled_flags, priority) do
     assert_headers_smaller_than_max_header_list_size(conn, headers)
 
     headers = Enum.map(headers, fn {name, value} -> {:store_name, name, value} end)
     {hbf, conn} = get_and_update_in(conn.encode_table, &HPACK.encode(headers, &1))
 
-    payload = headers_to_encoded_frames(conn, stream_id, hbf, enabled_flags)
+    payload = headers_to_encoded_frames(conn, stream_id, hbf, enabled_flags, priority)
 
     stream_state = if :end_stream in enabled_flags, do: :half_closed_local, else: :open
 
@@ -1150,22 +1174,31 @@ defmodule Mint.HTTP2 do
     end
   end
 
-  defp headers_to_encoded_frames(conn, stream_id, hbf, enabled_flags) do
+  defp headers_to_encoded_frames(conn, stream_id, hbf, enabled_flags, priority) do
     if IO.iodata_length(hbf) > conn.server_settings.max_frame_size do
       hbf
       |> IO.iodata_to_binary()
       |> split_payload_in_chunks(conn.server_settings.max_frame_size)
-      |> split_hbf_to_encoded_frames(stream_id, enabled_flags)
+      |> split_hbf_to_encoded_frames(stream_id, enabled_flags, priority)
     else
-      Frame.encode(
-        headers(stream_id: stream_id, hbf: hbf, flags: set_flags(:headers, enabled_flags))
-      )
+      headers(stream_id: stream_id, hbf: hbf, flags: set_flags(:headers, enabled_flags))
+      |> set_priority_on_headers_frame(priority)
+      |> Frame.encode()
     end
   end
 
-  defp split_hbf_to_encoded_frames({[first_chunk | chunks], last_chunk}, stream_id, enabled_flags) do
+  defp split_hbf_to_encoded_frames(
+         {[first_chunk | chunks], last_chunk},
+         stream_id,
+         enabled_flags,
+         priority
+       ) do
     flags = set_flags(:headers, enabled_flags -- [:end_headers])
-    first_frame = Frame.encode(headers(stream_id: stream_id, hbf: first_chunk, flags: flags))
+
+    first_frame =
+      headers(stream_id: stream_id, hbf: first_chunk, flags: flags)
+      |> set_priority_on_headers_frame(priority)
+      |> Frame.encode()
 
     middle_frames =
       Enum.map(chunks, fn chunk ->
@@ -1182,6 +1215,16 @@ defmodule Mint.HTTP2 do
     last_frame = Frame.encode(continuation(stream_id: stream_id, hbf: last_chunk, flags: flags))
 
     [first_frame, middle_frames, last_frame]
+  end
+
+  defp set_priority_on_headers_frame(headers_frame, nil), do: headers_frame
+
+  defp set_priority_on_headers_frame(headers_frame, {exclusive?, stream_dependency, weight}) do
+    headers(headers_frame,
+      exclusive?: exclusive?,
+      stream_dependency: stream_dependency || 0,
+      weight: weight
+    )
   end
 
   defp encode_data(conn, stream_id, data, enabled_flags) do

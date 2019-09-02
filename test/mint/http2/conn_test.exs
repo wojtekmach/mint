@@ -1443,6 +1443,35 @@ defmodule Mint.HTTP2Test do
                assert HTTP2.open?(conn)
              end) =~ "Ignoring PRIORITY frame"
     end
+
+    @tag :focus
+    test "can be set through the :priority option in request/6", %{conn: conn} do
+      assert {:ok, conn, ref} =
+               HTTP2.request(conn, "GET", "/", [], nil, priority: {false, nil, 1})
+
+      assert_recv_frames [headers(stream_id: stream_id) = frame]
+
+      _ = server_decode_headers(headers(frame, :hbf))
+
+      assert flag_set?(headers(frame, :flags), :headers, :priority)
+      assert headers(frame, :exclusive?) == false
+      assert headers(frame, :stream_dependency) == 0
+      assert headers(frame, :weight) == 1
+
+      assert {:ok, conn, _ref} =
+               HTTP2.request(conn, "GET", "/", [], nil, priority: {true, ref, 5})
+
+      assert_recv_frames [headers() = second_frame]
+
+      _ = server_decode_headers(headers(second_frame, :hbf))
+
+      assert flag_set?(headers(second_frame, :flags), :headers, :priority)
+      assert headers(second_frame, :exclusive?) == true
+      assert headers(second_frame, :stream_dependency) == stream_id
+      assert headers(second_frame, :weight) == 5
+
+      assert HTTP2.open?(conn)
+    end
   end
 
   describe "controlling process" do

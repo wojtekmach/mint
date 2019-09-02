@@ -448,6 +448,11 @@ defmodule Mint.HTTP do
   `content-length` header yourself. If you're using HTTP/1, Mint will do chunked
   transfer-encoding when a content-length is not provided (see `Mint.HTTP1.request/6`).
 
+  ## Options
+
+  HTTP/1 connections don't support any options in `request/6`. Options supported
+  by HTTP/2 connections are listed in the documentation for `Mint.HTTP2.request/6`.
+
   ## Examples
 
       Mint.HTTP.request(conn, "GET", "/", _headers = [], _body = nil)
@@ -460,13 +465,14 @@ defmodule Mint.HTTP do
           method :: String.t(),
           path :: String.t(),
           Types.headers(),
-          body :: iodata() | nil | :stream
+          body :: iodata() | nil | :stream,
+          keyword()
         ) ::
           {:ok, t(), Types.request_ref()}
           | {:error, t(), Types.error()}
 
-  def request(conn, method, path, headers, body),
-    do: conn_module(conn).request(conn, method, path, headers, body)
+  def request(conn, method, path, headers, body, options \\ []),
+    do: conn_module(conn).request(conn, method, path, headers, body, options)
 
   # TODO: remove on v1.0.
   @doc false
